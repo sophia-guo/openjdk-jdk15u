@@ -1,0 +1,303 @@
+name: jcov tests
+
+on:
+  push:
+    branches-ignore:
+      - master
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Platform(s) to execute on"
+        required: true
+        default: "Linux additional (hotspot only), Linux x64"
+
+jobs:
+  prerequisites:
+    name: Prerequisites
+    runs-on: "ubuntu-20.04"
+    outputs:
+      should_run: ${{ steps.check_submit.outputs.should_run }}
+      bundle_id: ${{ steps.check_bundle_id.outputs.bundle_id }}
+      platform_linux_x64: ${{ steps.check_platforms.outputs.platform_linux_x64 }}
+      dependencies: ${{ steps.check_deps.outputs.dependencies }}
+
+    steps:
+      - name: Check if submit tests should actually run depending on secrets and manual triggering
+        id: check_submit
+        run: echo "::set-output name=should_run::${{ github.event.inputs.platforms != '' || (!secrets.JDK_SUBMIT_FILTER || startsWith(github.ref, 'refs/heads/submit/')) }}"
+
+      - name: Check which platforms should be included
+        id: check_platforms
+        run: |
+          echo "::set-output name=platform_linux_x64::${{ contains(github.event.inputs.platforms, 'linux x64') || (github.event.inputs.platforms == '' && (secrets.JDK_SUBMIT_PLATFORMS == '' || contains(secrets.JDK_SUBMIT_PLATFORMS, 'linux x64'))) }}"
+        if: steps.check_submit.outputs.should_run != 'false'
+
+      - name: Determine unique bundle identifier
+        id: check_bundle_id
+        run: echo "::set-output name=bundle_id::${GITHUB_ACTOR}_${GITHUB_SHA:0:8}"
+        if: steps.check_submit.outputs.should_run != 'false'
+
+      - name: Checkout the source
+        uses: actions/checkout@v2
+        with:
+          path: jdk
+        if: steps.check_submit.outputs.should_run != 'false'
+
+      - name: Determine versions and locations to be used for dependencies
+        id: check_deps
+        run: "echo ::set-output name=dependencies::`cat make/conf/version-numbers.conf make/conf/test-dependencies | sed -e '1i {' -e 's/#.*//g' -e 's/\"//g' -e 's/\\(.*\\)=\\(.*\\)/\"\\1\": \"\\2\",/g' -e '$s/,\\s\\{0,\\}$/\\}/'`"
+        working-directory: jdk
+        if: steps.check_submit.outputs.should_run != 'false'
+
+      - name: Print extracted dependencies to the log
+        run: "echo '${{ steps.check_deps.outputs.dependencies }}'"
+        if: steps.check_submit.outputs.should_run != 'false'
+
+      - name: Determine the jtreg ref to checkout
+        run: "echo JTREG_REF=jtreg${{ fromJson(steps.check_deps.outputs.dependencies).JTREG_VERSION }}-${{ fromJson(steps.check_deps.outputs.dependencies).JTREG_BUILD }} >> $GITHUB_ENV"
+        if: steps.check_submit.outputs.should_run != 'false'
+
+      - name: Check if a jtreg image is present in the cache
+        id: jtreg
+        uses: actions/cache@v2
+        with:
+          path: ~/jtreg/
+          key: jtreg-${{ env.JTREG_REF }}-v1
+        if: steps.check_submit.outputs.should_run != 'false'
+
+      - name: Checkout the jtreg source
+        uses: actions/checkout@v2
+        with:
+          repository: "openjdk/jtreg"
+          ref: ${{ env.JTREG_REF }}
+          path: jtreg
+        if: steps.check_submit.outputs.should_run != 'false' && steps.jtreg.outputs.cache-hit != 'true'
+
+      - name: Build jtreg
+        run: sh make/build-all.sh ${JAVA_HOME_8_X64}
+        working-directory: jtreg
+        if: steps.check_submit.outputs.should_run != 'false' && steps.jtreg.outputs.cache-hit != 'true'
+
+      - name: Move jtreg image to destination folder
+        run: mv build/images/jtreg ~/
+        working-directory: jtreg
+        if: steps.check_submit.outputs.should_run != 'false' && steps.jtreg.outputs.cache-hit != 'true'
+
+      - name: Store jtreg for use by later steps
+        uses: actions/upload-artifact@v2
+        with:
+          name: transient_jtreg_${{ steps.check_bundle_id.outputs.bundle_id }}
+          path: ~/jtreg/
+        if: steps.check_submit.outputs.should_run != 'false'
+
+  linux_x64_build:
+    name: Linux x64
+    runs-on: "ubuntu-20.04"
+    needs: prerequisites
+    if: needs.prerequisites.outputs.should_run != 'false' && (needs.prerequisites.outputs.platform_linux_x64 != 'false' || needs.prerequisites.outputs.platform_linux_additional == 'true')
+
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor:
+          - build release
+          - build debug
+        include:
+          - flavor: build debug
+            flags: --enable-debug
+            artifact: -debug
+
+    env:
+      JDK_VERSION: "${{ fromJson(needs.prerequisites.outputs.dependencies).DEFAULT_VERSION_FEATURE }}"
+      BOOT_JDK_VERSION: "${{ fromJson(needs.prerequisites.outputs.dependencies).BOOT_JDK_VERSION }}"
+      BOOT_JDK_FILENAME: "${{ fromJson(needs.prerequisites.outputs.dependencies).LINUX_X64_BOOT_JDK_FILENAME }}"
+      BOOT_JDK_URL: "${{ fromJson(needs.prerequisites.outputs.dependencies).LINUX_X64_BOOT_JDK_URL }}"
+      BOOT_JDK_SHA256: "${{ fromJson(needs.prerequisites.outputs.dependencies).LINUX_X64_BOOT_JDK_SHA256 }}"
+
+    steps:
+      - name: Checkout the source
+        uses: actions/checkout@v2
+        with:
+          path: jdk
+
+      - name: Restore boot JDK from cache
+        id: bootjdk
+        uses: actions/cache@v2
+        with:
+          path: ~/bootjdk/${{ env.BOOT_JDK_VERSION }}
+          key: bootjdk-${{ runner.os }}-${{ env.BOOT_JDK_VERSION }}-${{ env.BOOT_JDK_SHA256 }}-v1
+
+      - name: Download boot JDK
+        run: |
+          mkdir -p "${HOME}/bootjdk/${BOOT_JDK_VERSION}"
+          wget -O "${HOME}/bootjdk/${BOOT_JDK_FILENAME}" "${BOOT_JDK_URL}"
+          echo "${BOOT_JDK_SHA256} ${HOME}/bootjdk/${BOOT_JDK_FILENAME}" | sha256sum -c >/dev/null -
+          tar -xf "${HOME}/bootjdk/${BOOT_JDK_FILENAME}" -C "${HOME}/bootjdk/${BOOT_JDK_VERSION}"
+          mv "${HOME}/bootjdk/${BOOT_JDK_VERSION}/"*/* "${HOME}/bootjdk/${BOOT_JDK_VERSION}/"
+        if: steps.bootjdk.outputs.cache-hit != 'true'
+
+      - name: Restore jtreg artifact
+        id: jtreg_restore
+        uses: actions/download-artifact@v2
+        with:
+          name: transient_jtreg_${{ needs.prerequisites.outputs.bundle_id }}
+          path: ~/jtreg/
+        continue-on-error: true
+
+      - name: Restore jtreg artifact (retry)
+        uses: actions/download-artifact@v2
+        with:
+          name: transient_jtreg_${{ needs.prerequisites.outputs.bundle_id }}
+          path: ~/jtreg/
+        if: steps.jtreg_restore.outcome == 'failure'
+
+      - name: Checkout gtest sources
+        uses: actions/checkout@v2
+        with:
+          repository: "google/googletest"
+          ref: "release-${{ fromJson(needs.prerequisites.outputs.dependencies).GTEST_VERSION }}"
+          path: gtest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install gcc-10=10.2.0-5ubuntu1~20.04 g++-10=10.2.0-5ubuntu1~20.04 libxrandr-dev libxtst-dev libcups2-dev libasound2-dev
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100 --slave /usr/bin/g++ g++ /usr/bin/g++-10
+      - name: check jcov
+        run: |
+          sudo ls ~/jtreg/lib/
+      - name: Configure
+        run: >
+          bash configure
+          --with-conf-name=linux-x64
+          ${{ matrix.flags }}
+          --with-version-opt=${GITHUB_ACTOR}-${GITHUB_SHA}
+          --with-version-build=0
+          --with-boot-jdk=${HOME}/bootjdk/${BOOT_JDK_VERSION}
+          --with-jtreg=${HOME}/jtreg
+          --with-jcov=${HOME}/jtreg
+          --with-gtest=${GITHUB_WORKSPACE}/gtest
+          --with-default-make-target="product-bundles test-bundles"
+          --with-zlib=system
+          --enable-jtreg-failure-handler
+        working-directory: jdk
+
+      - name: Build
+        run: make jcov-image CONF_NAME=linux-x64
+        working-directory: jdk
+
+      - name: Persist test bundles
+        uses: actions/upload-artifact@v2
+        with:
+          name: transient_jdk-linux-x64${{ matrix.artifact }}_${{ needs.prerequisites.outputs.bundle_id }}
+          path: |
+            jdk/build/linux-x64/bundles/jdk-${{ env.JDK_VERSION }}-internal+0_linux-x64_bin${{ matrix.artifact }}.tar.gz
+            jdk/build/linux-x64/bundles/jdk-${{ env.JDK_VERSION }}-internal+0_linux-x64_bin-tests${{ matrix.artifact }}.tar.gz
+
+  linux_x64_test:
+    name: Linux x64
+    runs-on: "ubuntu-20.04"
+    needs:
+      - prerequisites
+      - linux_x64_build
+
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - jdk/math
+        include:
+          - test: jdk/math
+            suites: test/jdk/:jdk_math
+    env:
+      JDK_VERSION: "${{ fromJson(needs.prerequisites.outputs.dependencies).DEFAULT_VERSION_FEATURE }}"
+      BOOT_JDK_VERSION: "${{ fromJson(needs.prerequisites.outputs.dependencies).BOOT_JDK_VERSION }}"
+      BOOT_JDK_FILENAME: "${{ fromJson(needs.prerequisites.outputs.dependencies).LINUX_X64_BOOT_JDK_FILENAME }}"
+      BOOT_JDK_URL: "${{ fromJson(needs.prerequisites.outputs.dependencies).LINUX_X64_BOOT_JDK_URL }}"
+      BOOT_JDK_SHA256: "${{ fromJson(needs.prerequisites.outputs.dependencies).LINUX_X64_BOOT_JDK_SHA256 }}"
+
+    steps:
+      - name: Checkout the source
+        uses: actions/checkout@v2
+
+      - name: Restore boot JDK from cache
+        id: bootjdk
+        uses: actions/cache@v2
+        with:
+          path: ~/bootjdk/${{ env.BOOT_JDK_VERSION }}
+          key: bootjdk-${{ runner.os }}-${{ env.BOOT_JDK_VERSION }}-${{ env.BOOT_JDK_SHA256 }}-v1
+
+      - name: Download boot JDK
+        run: |
+          mkdir -p "${HOME}/bootjdk/${BOOT_JDK_VERSION}"
+          wget -O "${HOME}/bootjdk/${BOOT_JDK_FILENAME}" "${BOOT_JDK_URL}"
+          echo "${BOOT_JDK_SHA256} ${HOME}/bootjdk/${BOOT_JDK_FILENAME}" | sha256sum -c >/dev/null -
+          tar -xf "${HOME}/bootjdk/${BOOT_JDK_FILENAME}" -C "${HOME}/bootjdk/${BOOT_JDK_VERSION}"
+          mv "${HOME}/bootjdk/${BOOT_JDK_VERSION}/"*/* "${HOME}/bootjdk/${BOOT_JDK_VERSION}/"
+        if: steps.bootjdk.outputs.cache-hit != 'true'
+
+      - name: Restore jtreg artifact
+        id: jtreg_restore
+        uses: actions/download-artifact@v2
+        with:
+          name: transient_jtreg_${{ needs.prerequisites.outputs.bundle_id }}
+          path: ~/jtreg/
+        continue-on-error: true
+
+      - name: Restore jtreg artifact (retry)
+        uses: actions/download-artifact@v2
+        with:
+          name: transient_jtreg_${{ needs.prerequisites.outputs.bundle_id }}
+          path: ~/jtreg/
+        if: steps.jtreg_restore.outcome == 'failure'
+
+      - name: Restore build artifacts
+        id: build_restore
+        uses: actions/download-artifact@v2
+        with:
+          name: transient_jdk-linux-x64${{ matrix.artifact }}_${{ needs.prerequisites.outputs.bundle_id }}
+          path: ~/jdk-linux-x64${{ matrix.artifact }}
+        continue-on-error: true
+
+      - name: Restore build artifacts (retry)
+        uses: actions/download-artifact@v2
+        with:
+          name: transient_jdk-linux-x64${{ matrix.artifact }}_${{ needs.prerequisites.outputs.bundle_id }}
+          path: ~/jdk-linux-x64${{ matrix.artifact }}
+        if: steps.build_restore.outcome == 'failure'
+
+      - name: Unpack jdk
+        run: |
+          mkdir -p "${HOME}/jdk-linux-x64${{ matrix.artifact }}/jdk-${{ env.JDK_VERSION }}-internal+0_linux-x64_bin${{ matrix.artifact }}"
+          tar -xf "${HOME}/jdk-linux-x64${{ matrix.artifact }}/jdk-${{ env.JDK_VERSION }}-internal+0_linux-x64_bin${{ matrix.artifact }}.tar.gz" -C "${HOME}/jdk-linux-x64${{ matrix.artifact }}/jdk-${{ env.JDK_VERSION }}-internal+0_linux-x64_bin${{ matrix.artifact }}"
+
+      - name: Unpack tests
+        run: |
+          mkdir -p "${HOME}/jdk-linux-x64${{ matrix.artifact }}/jdk-${{ env.JDK_VERSION }}-internal+0_linux-x64_bin-tests${{ matrix.artifact }}"
+          tar -xf "${HOME}/jdk-linux-x64${{ matrix.artifact }}/jdk-${{ env.JDK_VERSION }}-internal+0_linux-x64_bin-tests${{ matrix.artifact }}.tar.gz" -C "${HOME}/jdk-linux-x64${{ matrix.artifact }}/jdk-${{ env.JDK_VERSION }}-internal+0_linux-x64_bin-tests${{ matrix.artifact }}"
+
+      - name: Find root of jdk image dir
+        run: |
+          imageroot=`find ${HOME}/jdk-linux-x64${{ matrix.artifact }}/jdk-${{ env.JDK_VERSION }}-internal+0_linux-x64_bin${{ matrix.artifact }} -name release -type f`
+          echo "imageroot=`dirname ${imageroot}`" >> $GITHUB_ENV
+
+      - name: Run tests
+        run: >
+          JDK_IMAGE_DIR=${{ env.imageroot }}
+          TEST_IMAGE_DIR=${HOME}/jdk-linux-x64${{ matrix.artifact }}/jdk-${{ env.JDK_VERSION }}-internal+0_linux-x64_bin-tests${{ matrix.artifact }}
+          BOOT_JDK=${HOME}/bootjdk/${BOOT_JDK_VERSION}
+          JT_HOME=${HOME}/jtreg
+          make jcov-test TEST=jdk_math
+          JTREG_VERBOSE=fail,error,time
+          TEST_OPTS_JCOV=true
+          TEST_OPTS_JAVA_OPTIONS=
+          JTREG_KEYWORDS="!headful"
+          
+      - name: jcov results
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: jcovResult
+          path: ./**/test-results/jcov-output/
+        continue-on-error: true
+            
